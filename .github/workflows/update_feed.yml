@@ -1,11 +1,13 @@
 name: Update RSS Feed
 
+concurrency:
+  group: update-feed
+  cancel-in-progress: true
+
 on:
   schedule:
     - cron: '0 * * * *'
   workflow_dispatch:
-  push:
-    branches: [ main ]
 
 permissions:
   contents: write
@@ -36,5 +38,4 @@ jobs:
           git config --local user.name "github-actions[bot]"
           git add docs/feed.xml
           git diff --staged --quiet || git commit -m "Update feed $(date -u '+%Y-%m-%d %H:%M UTC')"
-          git pull --rebase origin main
-          git push
+          git push --force
