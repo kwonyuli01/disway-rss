@@ -2,9 +2,10 @@
 """
 Disway.id RSS Feed Scraper with Full Article Content
 =====================================================
-- Hanya artikel BARU yang masuk feed (belum pernah di-scrape sebelumnya)
-- Tanggal artikel = waktu saat scraping (date NOW), bukan tanggal asli
-- Artikel lama di-track via seen_articles.json
+- Hanya artikel BARU yang di-fetch kontennya
+- Artikel lama dipertahankan dari feed.xml sebelumnya
+- Tanggal artikel = waktu saat pertama kali di-scrape (date NOW)
+- Artikel dihapus dari feed setelah FEED_MAX_AGE_HOURS jam
 - Dijalankan otomatis via GitHub Actions + publish ke GitHub Pages
 """
 
@@ -17,6 +18,7 @@ import os
 import html
 import hashlib
 import json
+import xml.etree.ElementTree as ET
 
 # ============================================================
 # KONFIGURASI
@@ -31,9 +33,9 @@ FEED_TITLE = "Disway.id - Saldo Dana Gratis"
 FEED_DESCRIPTION = "RSS Feed dari disway.id dengan konten artikel lengkap"
 FEED_LINK = "https://disway.id"
 OUTPUT_FILE = "docs/feed.xml"
-SEEN_FILE = "seen_articles.json"  # Track artikel yang sudah pernah masuk
-FEED_MAX_AGE_HOURS = 3  # Artikel dihapus dari feed setelah X jam
-SEEN_MAX_AGE_DAYS = 30  # Hapus tracking artikel setelah X hari
+SEEN_FILE = "seen_articles.json"
+FEED_MAX_AGE_HOURS = 3
+SEEN_MAX_AGE_DAYS = 30
 REQUEST_DELAY = 2
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
@@ -48,11 +50,10 @@ session.headers.update({
 
 
 # ============================================================
-# TRACKING ARTIKEL YANG SUDAH PERNAH MASUK
+# TRACKING & EXISTING FEED
 # ============================================================
 
 def load_seen_articles():
-    """Load daftar artikel yang sudah pernah di-scrape."""
     if os.path.exists(SEEN_FILE):
         try:
             with open(SEEN_FILE, 'r', encoding='utf-8') as f:
@@ -63,15 +64,55 @@ def load_seen_articles():
 
 
 def save_seen_articles(seen):
-    """Simpan daftar artikel yang sudah pernah di-scrape."""
-    # Cleanup: hapus artikel yang lebih tua dari SEEN_MAX_AGE_DAYS
     cutoff = (datetime.now(timezone.utc) - timedelta(days=SEEN_MAX_AGE_DAYS)).isoformat()
     cleaned = {url: data for url, data in seen.items() if data.get('first_seen', '') > cutoff}
-
     with open(SEEN_FILE, 'w', encoding='utf-8') as f:
         json.dump(cleaned, f, indent=2, ensure_ascii=False)
-
     print(f"  [i] Tracked articles: {len(cleaned)} (cleaned {len(seen) - len(cleaned)} old entries)")
+
+
+def load_existing_feed():
+    """Baca feed.xml yang sudah ada dan extract artikel-artikel di dalamnya."""
+    existing = {}
+    if not os.path.exists(OUTPUT_FILE):
+        return existing
+
+    try:
+        with open(OUTPUT_FILE, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # Parse XML manual karena CDATA bisa bermasalah dengan ET
+        # Extract setiap <item>...</item>
+        items = re.findall(r'<item>(.*?)</item>', content, re.DOTALL)
+        for item_xml in items:
+            link_match = re.search(r'<link>(.*?)</link>', item_xml)
+            title_match = re.search(r'<title><!\[CDATA\[(.*?)\]\]></title>', item_xml)
+            pubdate_match = re.search(r'<pubDate>(.*?)</pubDate>', item_xml)
+            desc_match = re.search(r'<description><!\[CDATA\[(.*?)\]\]></description>', item_xml, re.DOTALL)
+            content_match = re.search(r'<content:encoded><!\[CDATA\[(.*?)\]\]></content:encoded>', item_xml, re.DOTALL)
+            guid_match = re.search(r'<guid[^>]*>(.*?)</guid>', item_xml)
+            image_match = re.search(r'<media:content url="(.*?)"', item_xml)
+
+            # Extract categories
+            categories = re.findall(r'<category><!\[CDATA\[(.*?)\]\]></category>', item_xml)
+
+            if link_match:
+                link = link_match.group(1).strip()
+                existing[link] = {
+                    'title': title_match.group(1) if title_match else '',
+                    'link': link,
+                    'pub_date': pubdate_match.group(1).strip() if pubdate_match else '',
+                    'description_html': content_match.group(1) if content_match else (desc_match.group(1) if desc_match else ''),
+                    'guid': guid_match.group(1).strip() if guid_match else link,
+                    'image': image_match.group(1) if image_match else '',
+                    'categories': categories,
+                }
+
+        print(f"  [i] Artikel di feed lama: {len(existing)}")
+    except Exception as e:
+        print(f"  [!] Gagal baca feed lama: {e}")
+
+    return existing
 
 
 # ============================================================
@@ -137,7 +178,7 @@ def parse_article_page(url):
     h1 = soup.find('h1')
     article_data['title'] = h1.get_text(strip=True) if h1 else ''
 
-    # TANGGAL ASLI (simpan sebagai referensi di konten, tapi TIDAK dipakai sebagai pubDate)
+    # TANGGAL ASLI (referensi saja)
     date_text = ''
     for text in soup.find_all(string=re.compile(r'(Senin|Selasa|Rabu|Kamis|Jumat|Sabtu|Minggu)\s+\d{2}-\d{2}-\d{4}')):
         date_text = text.strip()
@@ -314,7 +355,6 @@ def fetch_additional_page(url):
 # ============================================================
 
 def make_pub_date(dt=None):
-    """Buat tanggal RFC 822 dari datetime object. Default = sekarang."""
     if dt is None:
         dt = datetime.now(timezone.utc)
     days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
@@ -323,57 +363,75 @@ def make_pub_date(dt=None):
     return f"{days[dt.weekday()]}, {dt.day:02d} {months[dt.month-1]} {dt.year} {dt.hour:02d}:{dt.minute:02d}:00 +0700"
 
 
-def generate_rss(articles_data):
-    print(f"\n[*] Generating RSS XML with {len(articles_data)} new articles...")
+def build_article_html(article):
+    """Bangun HTML content dari article data yang baru di-fetch."""
+    content_html = ''
+    if article.get('image'):
+        content_html += f'<p><img src="{html.escape(article["image"])}" alt="{html.escape(article.get("title", ""))}" style="max-width:100%;" /></p>\n'
+    if article.get('caption'):
+        content_html += f'<p><em>{html.escape(article["caption"])}</em></p>\n'
+    if article.get('reporter'):
+        content_html += f'<p><strong>Reporter:</strong> {html.escape(article["reporter"])}'
+        if article.get('editor'):
+            content_html += f' | <strong>Editor:</strong> {html.escape(article["editor"])}'
+        content_html += '</p>\n'
+    if article.get('original_date'):
+        content_html += f'<p><em>Tanggal asli: {html.escape(article["original_date"])}</em></p>\n'
+    if article.get('content'):
+        paragraphs = article['content'].split('\n\n')
+        for para in paragraphs:
+            para = para.strip()
+            if not para:
+                continue
+            if para.startswith('### '):
+                content_html += f'<h3>{html.escape(para[4:])}</h3>\n'
+            else:
+                content_html += f'<p>{html.escape(para)}</p>\n'
+    if article.get('tags'):
+        tags_str = ', '.join(article['tags'])
+        content_html += f'<p><strong>Tags:</strong> {html.escape(tags_str)}</p>\n'
+    return content_html
+
+
+def generate_rss(new_articles, existing_feed):
+    """Generate RSS XML: artikel baru + artikel lama dari feed sebelumnya."""
     now = datetime.now(timezone(timedelta(hours=7))).strftime('%a, %d %b %Y %H:%M:%S +0700')
 
-    rss_items = []
-    for article in articles_data:
+    # Gabungkan: artikel baru (fresh) + artikel lama (dari feed.xml lama)
+    all_items = []
+
+    # 1. Tambah artikel baru dengan full content
+    for article in new_articles:
         if not article:
             continue
-
-        content_html = ''
-        if article.get('image'):
-            content_html += f'<p><img src="{html.escape(article["image"])}" alt="{html.escape(article.get("title", ""))}" style="max-width:100%;" /></p>\n'
-        if article.get('caption'):
-            content_html += f'<p><em>{html.escape(article["caption"])}</em></p>\n'
-        if article.get('reporter'):
-            content_html += f'<p><strong>Reporter:</strong> {html.escape(article["reporter"])}'
-            if article.get('editor'):
-                content_html += f' | <strong>Editor:</strong> {html.escape(article["editor"])}'
-            content_html += '</p>\n'
-
-        # Tampilkan tanggal asli di dalam konten sebagai referensi
-        if article.get('original_date'):
-            content_html += f'<p><em>Tanggal asli: {html.escape(article["original_date"])}</em></p>\n'
-
-        if article.get('content'):
-            paragraphs = article['content'].split('\n\n')
-            for para in paragraphs:
-                para = para.strip()
-                if not para:
-                    continue
-                if para.startswith('### '):
-                    content_html += f'<h3>{html.escape(para[4:])}</h3>\n'
-                else:
-                    content_html += f'<p>{html.escape(para)}</p>\n'
-        if article.get('tags'):
-            tags_str = ', '.join(article['tags'])
-            content_html += f'<p><strong>Tags:</strong> {html.escape(tags_str)}</p>\n'
-
+        content_html = build_article_html(article)
         guid = article.get('link', hashlib.md5(article.get('title', '').encode()).hexdigest())
 
-        rss_items.append({
+        categories = []
+        if article.get('category'):
+            categories.append(article['category'])
+        categories.extend(article.get('tags', []))
+
+        all_items.append({
             'title': article.get('title', 'Tanpa Judul'),
             'link': article.get('link', ''),
-            'description': content_html,
-            'pubDate': article.get('pub_date', now),  # Ini sudah date NOW
-            'category': article.get('category', ''),
-            'tags': article.get('tags', []),
+            'description_html': content_html,
+            'pubDate': article.get('pub_date', now),
             'guid': guid,
             'image': article.get('image', ''),
+            'categories': categories,
         })
 
+    # 2. Tambah artikel lama dari feed.xml (pertahankan konten asli)
+    for link, item in existing_feed.items():
+        # Skip jika sudah ada di artikel baru
+        if any(a.get('link') == link for a in new_articles):
+            continue
+        all_items.append(item)
+
+    print(f"\n[*] Generating RSS XML: {len(new_articles)} baru + {len(all_items) - len(new_articles)} lama = {len(all_items)} total")
+
+    # Build XML
     rss_xml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"
      xmlns:dc="http://purl.org/dc/elements/1.1/"
@@ -389,21 +447,20 @@ def generate_rss(articles_data):
     <generator>Disway RSS Scraper (GitHub Actions)</generator>
 '''
 
-    for item in rss_items:
+    for item in all_items:
         rss_xml += f'''    <item>
-      <title><![CDATA[{item['title']}]]></title>
-      <link>{html.escape(item['link'])}</link>
-      <guid isPermaLink="true">{html.escape(item['guid'])}</guid>
-      <pubDate>{item['pubDate']}</pubDate>
+      <title><![CDATA[{item.get('title', '')}]]></title>
+      <link>{html.escape(item.get('link', ''))}</link>
+      <guid isPermaLink="true">{html.escape(item.get('guid', item.get('link', '')))}</guid>
+      <pubDate>{item.get('pubDate', item.get('pub_date', now))}</pubDate>
 '''
-        if item['category']:
-            rss_xml += f'      <category><![CDATA[{item["category"]}]]></category>\n'
-        for tag in item.get('tags', []):
-            rss_xml += f'      <category><![CDATA[{tag}]]></category>\n'
-        if item['image']:
+        for cat in item.get('categories', []):
+            rss_xml += f'      <category><![CDATA[{cat}]]></category>\n'
+        if item.get('image'):
             rss_xml += f'      <media:content url="{html.escape(item["image"])}" medium="image" />\n'
-        rss_xml += f'      <description><![CDATA[{item["description"]}]]></description>\n'
-        rss_xml += f'      <content:encoded><![CDATA[{item["description"]}]]></content:encoded>\n'
+        desc = item.get('description_html', '')
+        rss_xml += f'      <description><![CDATA[{desc}]]></description>\n'
+        rss_xml += f'      <content:encoded><![CDATA[{desc}]]></content:encoded>\n'
         rss_xml += '    </item>\n'
 
     rss_xml += '''  </channel>
@@ -422,11 +479,27 @@ def main():
 
     os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
 
-    # Step 1: Load daftar artikel yang sudah pernah di-scrape
+    # Step 1: Load tracking + feed lama
     seen = load_seen_articles()
-    print(f"  [i] Artikel yang sudah ditrack: {len(seen)}")
+    existing_feed = load_existing_feed()
+    print(f"  [i] Artikel sudah ditrack: {len(seen)}")
 
-    # Step 2: Scrape halaman list
+    # Step 2: Hapus artikel lama dari existing feed (> FEED_MAX_AGE_HOURS)
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=FEED_MAX_AGE_HOURS)).isoformat()
+    fresh_existing = {}
+    for link, item in existing_feed.items():
+        if link in seen and seen[link].get('first_seen', '') > cutoff:
+            fresh_existing[link] = item
+        elif link not in seen:
+            # Artikel dari feed lama tanpa tracking — pertahankan sementara
+            fresh_existing[link] = item
+    
+    removed = len(existing_feed) - len(fresh_existing)
+    if removed > 0:
+        print(f"  [i] Dihapus {removed} artikel lama (> {FEED_MAX_AGE_HOURS} jam)")
+    existing_feed = fresh_existing
+
+    # Step 3: Scrape halaman list
     all_articles = []
     for url in SCRAPE_URLS:
         articles = parse_list_page(url)
@@ -434,14 +507,15 @@ def main():
         time.sleep(REQUEST_DELAY)
 
     if not all_articles:
-        print("\n[!] Tidak ada artikel ditemukan.")
-        # Tetap generate feed kosong
-        rss_xml = generate_rss([])
+        print("\n[!] Tidak ada artikel ditemukan di halaman.")
+        # Pertahankan feed lama
+        rss_xml = generate_rss([], existing_feed)
         with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
             f.write(rss_xml)
+        save_seen_articles(seen)
         return
 
-    # Step 3: Filter hanya artikel BARU (belum pernah masuk seen)
+    # Step 4: Filter hanya artikel BARU
     new_articles = []
     for article in all_articles:
         if article['link'] not in seen:
@@ -449,36 +523,24 @@ def main():
 
     print(f"\n[*] Artikel baru: {len(new_articles)} dari {len(all_articles)} total")
 
-    if not new_articles:
-        print("[i] Tidak ada artikel baru. Feed tetap kosong.")
-        # Generate feed kosong (atau pertahankan artikel recent)
-        # Ambil artikel yang masih dalam window FEED_MAX_AGE_HOURS
-        recent_in_feed = get_recent_feed_articles(seen)
-        rss_xml = generate_rss(recent_in_feed)
-        with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
-            f.write(rss_xml)
-        save_seen_articles(seen)
-        return
-
-    # Step 4: Fetch konten lengkap HANYA untuk artikel baru
+    # Step 5: Fetch konten lengkap HANYA untuk artikel baru
     now = datetime.now(timezone.utc)
-    articles_data = []
+    new_articles_data = []
 
     for i, article in enumerate(new_articles):
         print(f"\n--- Artikel Baru {i+1}/{len(new_articles)} ---")
         article_data = parse_article_page(article['link'])
 
-        # Set pubDate ke waktu SEKARANG (bukan tanggal asli)
-        pub_date_now = make_pub_date(now + timedelta(minutes=i))  # Spread waktu 1 menit per artikel
+        pub_date_now = make_pub_date(now + timedelta(minutes=i))
 
         if article_data:
             if not article_data.get('title'):
                 article_data['title'] = article['title']
             article_data['link'] = article['link']
             article_data['pub_date'] = pub_date_now
-            articles_data.append(article_data)
+            new_articles_data.append(article_data)
         else:
-            articles_data.append({
+            new_articles_data.append({
                 'title': article['title'],
                 'link': article['link'],
                 'content': '(Konten tidak dapat diambil)',
@@ -497,13 +559,8 @@ def main():
 
         time.sleep(REQUEST_DELAY)
 
-    # Step 5: Tambahkan juga artikel recent yang masih dalam window
-    recent_in_feed = get_recent_feed_articles(seen)
-    # Gabungkan: artikel baru + artikel recent yang masih dalam window
-    all_feed_articles = articles_data + recent_in_feed
-
-    # Step 6: Generate & simpan RSS
-    rss_xml = generate_rss(all_feed_articles)
+    # Step 6: Generate RSS (artikel baru + artikel lama dari feed.xml)
+    rss_xml = generate_rss(new_articles_data, existing_feed)
     with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
         f.write(rss_xml)
 
@@ -512,30 +569,10 @@ def main():
 
     print(f"\n{'=' * 60}")
     print(f"  SELESAI!")
-    print(f"  Artikel baru di feed  : {len(articles_data)}")
-    print(f"  Artikel recent di feed: {len(recent_in_feed)}")
-    print(f"  Total di feed         : {len(all_feed_articles)}")
+    print(f"  Artikel baru        : {len(new_articles_data)}")
+    print(f"  Artikel lama di feed: {len(existing_feed)}")
     print(f"  File: {OUTPUT_FILE}")
     print(f"{'=' * 60}")
-
-
-def get_recent_feed_articles(seen):
-    """Ambil artikel dari seen yang masih dalam window FEED_MAX_AGE_HOURS.
-    Return sebagai list minimal data (tanpa re-fetch konten)."""
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=FEED_MAX_AGE_HOURS)).isoformat()
-    recent = []
-    for url, data in seen.items():
-        if data.get('first_seen', '') > cutoff and data.get('pub_date'):
-            recent.append({
-                'title': data.get('title', 'Tanpa Judul'),
-                'link': url,
-                'content': '',  # Tidak re-fetch konten lama
-                'pub_date': data.get('pub_date', ''),
-                'original_date': '',
-                'image': '', 'reporter': '', 'editor': '',
-                'tags': [], 'category': '', 'caption': '',
-            })
-    return recent
 
 
 if __name__ == '__main__':
