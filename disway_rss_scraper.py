@@ -325,7 +325,7 @@ def make_pub_date(dt=None):
 
 def generate_rss(articles_data):
     print(f"\n[*] Generating RSS XML with {len(articles_data)} new articles...")
-    now = datetime.now(timezone.utc).strftime('%a, %d %b %Y %H:%M:%S +0000')
+    now = datetime.now(timezone(timedelta(hours=7))).strftime('%a, %d %b %Y %H:%M:%S +0700')
 
     rss_items = []
     for article in articles_data:
