@@ -1,14 +1,18 @@
 name: Update RSS Feed
 
-concurrency:
-  group: update-feed
-  cancel-in-progress: true
-
 on:
+  # Jalankan otomatis setiap 1 jam
   schedule:
-    - cron: '*/45 * * * *'  # Runs every hour
+    - cron: '*/15 * * * *'
+  
+  # Juga bisa dijalankan manual dari GitHub
   workflow_dispatch:
 
+  # Jalankan saat push ke main
+  push:
+    branches: [ main ]
+
+# Izinkan GitHub Actions menulis ke repository
 permissions:
   contents: write
   pages: write
@@ -16,7 +20,7 @@ permissions:
 jobs:
   update-feed:
     runs-on: ubuntu-latest
-
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -36,6 +40,5 @@ jobs:
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
-          git add docs/feed.xml seen_articles.json
-          git diff --staged --quiet || git commit -m "Update feed $(date -u '+%Y-%m-%d %H:%M UTC')"
-          git push --force
+          git add docs/feed.xml
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update feed $(date -u '+%Y-%m-%d %H:%M UTC')" && git push)
